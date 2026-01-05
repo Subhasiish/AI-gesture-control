@@ -156,7 +156,7 @@ export const ARExperience = () => {
           </motion.div>
         </>
       )}
-      
+
       {/* Noise Overlay - Always visible for texture */}
       <div className="noise-overlay" />
     </div>
