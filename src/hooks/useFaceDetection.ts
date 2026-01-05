@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FaceLandmarks } from "@/types/glasses";
+import * as faceapi from "face-api.js";
 
 interface UseFaceDetectionProps {
   videoRef: React.RefObject<HTMLVideoElement>;
@@ -14,148 +15,151 @@ const smoothValue = (current: number, previous: number, factor = 0.3): number =>
 export const useFaceDetection = ({ videoRef, onLandmarksUpdate }: UseFaceDetectionProps) => {
   const [isLoading, setIsLoading] = useState(true);
   const [isFaceDetected, setIsFaceDetected] = useState(false);
-  const faceMeshRef = useRef<any>(null);
   const previousLandmarks = useRef<FaceLandmarks | null>(null);
   const animationFrameRef = useRef<number>();
+  const isInitialized = useRef(false);
 
-  const processResults = useCallback((results: any) => {
-    if (!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) {
+  const processVideo = useCallback(async () => {
+    if (!videoRef.current || !isInitialized.current) return;
+
+    try {
+      const detections = await faceapi
+        .detectSingleFace(videoRef.current, new faceapi.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.5 }))
+        .withFaceLandmarks();
+
+      if (!detections) {
+        setIsFaceDetected(false);
+        onLandmarksUpdate(null);
+        return;
+      }
+
+      const landmarks = detections.landmarks;
+      const positions = landmarks.positions;
+
+      // Key facial landmarks indices for face-api.js
+      // Left eye: indices 36-41 (we'll use corners)
+      // Right eye: indices 42-47
+      // Nose: indices 27-35
+      // Jaw: indices 0-16
+
+      // Calculate eye centers
+      const leftEyePoints = positions.slice(36, 42);
+      const rightEyePoints = positions.slice(42, 48);
+
+      const leftEye = {
+        x: leftEyePoints.reduce((sum, p) => sum + p.x, 0) / leftEyePoints.length / videoRef.current!.videoWidth,
+        y: leftEyePoints.reduce((sum, p) => sum + p.y, 0) / leftEyePoints.length / videoRef.current!.videoHeight,
+      };
+
+      const rightEye = {
+        x: rightEyePoints.reduce((sum, p) => sum + p.x, 0) / rightEyePoints.length / videoRef.current!.videoWidth,
+        y: rightEyePoints.reduce((sum, p) => sum + p.y, 0) / rightEyePoints.length / videoRef.current!.videoHeight,
+      };
+
+      // Nose bridge (use nose tip)
+      const noseBridge = {
+        x: positions[30].x / videoRef.current!.videoWidth,
+        y: positions[30].y / videoRef.current!.videoHeight,
+      };
+
+      // Temples (approximate using jaw points)
+      const leftTemple = {
+        x: positions[0].x / videoRef.current!.videoWidth,
+        y: positions[0].y / videoRef.current!.videoHeight,
+      };
+
+      const rightTemple = {
+        x: positions[16].x / videoRef.current!.videoWidth,
+        y: positions[16].y / videoRef.current!.videoHeight,
+      };
+
+      // Calculate face width and angle
+      const faceWidth = Math.sqrt(
+        Math.pow(rightTemple.x - leftTemple.x, 2) +
+        Math.pow(rightTemple.y - leftTemple.y, 2)
+      );
+
+      const faceAngle = Math.atan2(
+        rightEye.y - leftEye.y,
+        rightEye.x - leftEye.x
+      );
+
+      // Scale factor based on face width
+      const scale = faceWidth / 0.4;
+
+      const newLandmarks: FaceLandmarks = {
+        leftEye,
+        rightEye,
+        noseBridge,
+        leftTemple,
+        rightTemple,
+        faceWidth,
+        faceAngle,
+        scale,
+      };
+
+      // Apply temporal smoothing
+      if (previousLandmarks.current) {
+        const smoothed: FaceLandmarks = {
+          leftEye: {
+            x: smoothValue(newLandmarks.leftEye.x, previousLandmarks.current.leftEye.x),
+            y: smoothValue(newLandmarks.leftEye.y, previousLandmarks.current.leftEye.y),
+          },
+          rightEye: {
+            x: smoothValue(newLandmarks.rightEye.x, previousLandmarks.current.rightEye.x),
+            y: smoothValue(newLandmarks.rightEye.y, previousLandmarks.current.rightEye.y),
+          },
+          noseBridge: {
+            x: smoothValue(newLandmarks.noseBridge.x, previousLandmarks.current.noseBridge.x),
+            y: smoothValue(newLandmarks.noseBridge.y, previousLandmarks.current.noseBridge.y),
+          },
+          leftTemple: {
+            x: smoothValue(newLandmarks.leftTemple.x, previousLandmarks.current.leftTemple.x),
+            y: smoothValue(newLandmarks.leftTemple.y, previousLandmarks.current.leftTemple.y),
+          },
+          rightTemple: {
+            x: smoothValue(newLandmarks.rightTemple.x, previousLandmarks.current.rightTemple.x),
+            y: smoothValue(newLandmarks.rightTemple.y, previousLandmarks.current.rightTemple.y),
+          },
+          faceWidth: smoothValue(newLandmarks.faceWidth, previousLandmarks.current.faceWidth),
+          faceAngle: smoothValue(newLandmarks.faceAngle, previousLandmarks.current.faceAngle, 0.2),
+          scale: smoothValue(newLandmarks.scale, previousLandmarks.current.scale),
+        };
+        previousLandmarks.current = smoothed;
+        setIsFaceDetected(true);
+        onLandmarksUpdate(smoothed);
+      } else {
+        previousLandmarks.current = newLandmarks;
+        setIsFaceDetected(true);
+        onLandmarksUpdate(newLandmarks);
+      }
+    } catch (error) {
+      console.error("Face detection error:", error);
       setIsFaceDetected(false);
       onLandmarksUpdate(null);
-      return;
     }
 
-    const landmarks = results.multiFaceLandmarks[0];
-    
-    // Key facial landmarks indices
-    // Left eye outer corner: 33, inner: 133
-    // Right eye outer corner: 263, inner: 362
-    // Nose bridge top: 6
-    // Left temple: 127, Right temple: 356
-    
-    const leftEyeOuter = landmarks[33];
-    const leftEyeInner = landmarks[133];
-    const rightEyeOuter = landmarks[263];
-    const rightEyeInner = landmarks[362];
-    const noseBridge = landmarks[6];
-    const leftTemple = landmarks[127];
-    const rightTemple = landmarks[356];
-
-    // Calculate eye centers
-    const leftEye = {
-      x: (leftEyeOuter.x + leftEyeInner.x) / 2,
-      y: (leftEyeOuter.y + leftEyeInner.y) / 2,
-    };
-
-    const rightEye = {
-      x: (rightEyeOuter.x + rightEyeInner.x) / 2,
-      y: (rightEyeOuter.y + rightEyeInner.y) / 2,
-    };
-
-    // Calculate face width and angle
-    const faceWidth = Math.sqrt(
-      Math.pow(rightTemple.x - leftTemple.x, 2) +
-      Math.pow(rightTemple.y - leftTemple.y, 2)
-    );
-
-    const faceAngle = Math.atan2(
-      rightEye.y - leftEye.y,
-      rightEye.x - leftEye.x
-    );
-
-    // Scale factor based on face width (normalized 0-1 coords)
-    const scale = faceWidth / 0.4; // Baseline face width
-
-    const newLandmarks: FaceLandmarks = {
-      leftEye,
-      rightEye,
-      noseBridge: { x: noseBridge.x, y: noseBridge.y },
-      leftTemple: { x: leftTemple.x, y: leftTemple.y },
-      rightTemple: { x: rightTemple.x, y: rightTemple.y },
-      faceWidth,
-      faceAngle,
-      scale,
-    };
-
-    // Apply temporal smoothing
-    if (previousLandmarks.current) {
-      const smoothed: FaceLandmarks = {
-        leftEye: {
-          x: smoothValue(newLandmarks.leftEye.x, previousLandmarks.current.leftEye.x),
-          y: smoothValue(newLandmarks.leftEye.y, previousLandmarks.current.leftEye.y),
-        },
-        rightEye: {
-          x: smoothValue(newLandmarks.rightEye.x, previousLandmarks.current.rightEye.x),
-          y: smoothValue(newLandmarks.rightEye.y, previousLandmarks.current.rightEye.y),
-        },
-        noseBridge: {
-          x: smoothValue(newLandmarks.noseBridge.x, previousLandmarks.current.noseBridge.x),
-          y: smoothValue(newLandmarks.noseBridge.y, previousLandmarks.current.noseBridge.y),
-        },
-        leftTemple: {
-          x: smoothValue(newLandmarks.leftTemple.x, previousLandmarks.current.leftTemple.x),
-          y: smoothValue(newLandmarks.leftTemple.y, previousLandmarks.current.leftTemple.y),
-        },
-        rightTemple: {
-          x: smoothValue(newLandmarks.rightTemple.x, previousLandmarks.current.rightTemple.x),
-          y: smoothValue(newLandmarks.rightTemple.y, previousLandmarks.current.rightTemple.y),
-        },
-        faceWidth: smoothValue(newLandmarks.faceWidth, previousLandmarks.current.faceWidth),
-        faceAngle: smoothValue(newLandmarks.faceAngle, previousLandmarks.current.faceAngle, 0.2),
-        scale: smoothValue(newLandmarks.scale, previousLandmarks.current.scale),
-      };
-      previousLandmarks.current = smoothed;
-      setIsFaceDetected(true);
-      onLandmarksUpdate(smoothed);
-    } else {
-      previousLandmarks.current = newLandmarks;
-      setIsFaceDetected(true);
-      onLandmarksUpdate(newLandmarks);
-    }
-  }, [onLandmarksUpdate]);
+    animationFrameRef.current = requestAnimationFrame(processVideo);
+  }, [videoRef, onLandmarksUpdate]);
 
   useEffect(() => {
     let isMounted = true;
 
-    const initFaceMesh = async () => {
+    const initFaceAPI = async () => {
       try {
-        // Dynamic import for MediaPipe
-        const { FaceMesh } = await import("@mediapipe/face_mesh");
-        const { Camera } = await import("@mediapipe/camera_utils");
+        // Load face-api.js models
+        await Promise.all([
+          faceapi.nets.tinyFaceDetector.loadFromUri('/models'),
+          faceapi.nets.faceLandmark68Net.loadFromUri('/models'),
+        ]);
 
-        if (!isMounted || !videoRef.current) return;
+        if (!isMounted) return;
 
-        const faceMesh = new FaceMesh({
-          locateFile: (file) => {
-            return `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`;
-          },
-        });
+        isInitialized.current = true;
+        setIsLoading(false);
 
-        faceMesh.setOptions({
-          maxNumFaces: 1,
-          refineLandmarks: true,
-          minDetectionConfidence: 0.5,
-          minTrackingConfidence: 0.5,
-        });
-
-        faceMesh.onResults(processResults);
-        faceMeshRef.current = faceMesh;
-
-        const camera = new Camera(videoRef.current, {
-          onFrame: async () => {
-            if (videoRef.current && faceMeshRef.current) {
-              await faceMeshRef.current.send({ image: videoRef.current });
-            }
-          },
-          width: 1280,
-          height: 720,
-        });
-
-        await camera.start();
-        
-        if (isMounted) {
-          setIsLoading(false);
-        }
+        // Start processing
+        processVideo();
       } catch (error) {
         console.error("Failed to initialize face detection:", error);
         if (isMounted) {
@@ -164,18 +168,16 @@ export const useFaceDetection = ({ videoRef, onLandmarksUpdate }: UseFaceDetecti
       }
     };
 
-    initFaceMesh();
+    initFaceAPI();
 
     return () => {
       isMounted = false;
       if (animationFrameRef.current) {
         cancelAnimationFrame(animationFrameRef.current);
       }
-      if (faceMeshRef.current) {
-        faceMeshRef.current.close();
-      }
+      isInitialized.current = false;
     };
-  }, [videoRef, processResults]);
+  }, [processVideo]);
 
   return { isLoading, isFaceDetected };
 };
